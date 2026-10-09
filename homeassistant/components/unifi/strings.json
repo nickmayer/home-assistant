@@ -117,6 +117,12 @@
       "device_uplink_mac": {
         "name": "Uplink MAC"
       },
+      "network_clients": {
+        "name": "Clients"
+      },
+      "network_traffic": {
+        "name": "Traffic"
+      },
       "outlet_power": {
         "name": "{outlet_name} outlet power"
       },

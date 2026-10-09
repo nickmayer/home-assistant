@@ -2592,3 +2592,176 @@ async def test_device_uplink(
     device["uplink"]["uplink_mac"] = "00:00:00:00:00:03"
     mock_websocket_message(message=MessageKey.DEVICE, data=device)
     assert hass.states.get("sensor.device_uplink_mac").state == "00:00:00:00:00:03"
+
+
+NETWORK_LAN = {
+    "_id": "network-lan",
+    "name": "LAN",
+    "enabled": True,
+    "purpose": "corporate",
+    "vlan_enabled": False,
+}
+NETWORK_VLAN = {
+    "_id": "network-vlan",
+    "name": "Kids",
+    "enabled": True,
+    "purpose": "corporate",
+    "vlan": 11,
+    "vlan_enabled": True,
+}
+NETWORK_WAN = {
+    "_id": "network-wan",
+    "name": "Internet 1",
+    "enabled": True,
+    "purpose": "wan",
+}
+NETWORKS = [NETWORK_LAN, NETWORK_VLAN, NETWORK_WAN]
+
+
+def _network_client(
+    mac: str,
+    network_id: str,
+    *,
+    wired: bool = False,
+    last_seen: float | None = None,
+    rx_bytes_r: float = 0,
+    tx_bytes_r: float = 0,
+) -> dict[str, Any]:
+    """Create a client payload, rates are given in bytes per second."""
+    client: dict[str, Any] = {
+        "is_wired": wired,
+        "last_seen": dt_util.as_timestamp(dt_util.utcnow())
+        if last_seen is None
+        else last_seen,
+        "mac": mac,
+        "name": f"Client {mac[-2:]}",
+        "network_id": network_id,
+        "oui": "Producer",
+    }
+    if wired:
+        client["wired-rx_bytes-r"] = rx_bytes_r
+        client["wired-tx_bytes-r"] = tx_bytes_r
+        # Wired clients are measured on the wired counters only
+        client["rx_bytes-r"] = 999_000_000
+        client["tx_bytes-r"] = 999_000_000
+    else:
+        client["rx_bytes-r"] = rx_bytes_r
+        client["tx_bytes-r"] = tx_bytes_r
+    return client
+
+
+@pytest.mark.parametrize("network_payload", [NETWORKS])
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_network_sensor_entity_and_device_data(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    config_entry_factory: ConfigEntryFactoryType,
+    client_payload: list[dict[str, Any]],
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Validate network sensor entity and device data."""
+    client_payload += [
+        _network_client("00:00:00:00:00:01", "network-vlan", rx_bytes_r=125_000),
+        _network_client("00:00:00:00:00:02", "network-lan"),
+    ]
+    with patch("homeassistant.components.unifi.PLATFORMS", [Platform.SENSOR]):
+        config_entry = await config_entry_factory()
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
+
+
+@pytest.mark.parametrize("network_payload", [NETWORKS])
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_network_sensors(
+    hass: HomeAssistant,
+    config_entry_factory: ConfigEntryFactoryType,
+    mock_websocket_message: WebsocketMessageMock,
+    mock_websocket_state: WebsocketStateManager,
+    client_payload: list[dict[str, Any]],
+) -> None:
+    """Verify that network sensors are working as expected."""
+    client_payload += [
+        _network_client(
+            "00:00:00:00:00:01", "network-vlan", rx_bytes_r=125_000, tx_bytes_r=125_000
+        ),
+        _network_client(
+            "00:00:00:00:00:02", "network-vlan", wired=True, rx_bytes_r=250_000
+        ),
+        _network_client("00:00:00:00:00:03", "network-vlan", last_seen=0),
+        _network_client("00:00:00:00:00:04", "network-lan", rx_bytes_r=1_250_000),
+        _network_client("00:00:00:00:00:05", "unknown-network", rx_bytes_r=5_000_000),
+    ]
+    await config_entry_factory()
+
+    # Networks clients cannot connect to, like WAN, get no sensors
+    assert len(hass.states.async_entity_ids(SENSOR_DOMAIN)) == 4
+    assert hass.states.get("sensor.kids_clients").state == "2"
+    assert hass.states.get("sensor.kids_traffic").state == "4.0"
+    assert hass.states.get("sensor.lan_clients").state == "1"
+    assert hass.states.get("sensor.lan_traffic").state == "10.0"
+
+    # A client moves to another network
+    mock_websocket_message(
+        message=MessageKey.CLIENT,
+        data=_network_client("00:00:00:00:00:04", "network-vlan", rx_bytes_r=62_500),
+    )
+    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.kids_clients").state == "3"
+    assert hass.states.get("sensor.kids_traffic").state == "4.5"
+    assert hass.states.get("sensor.lan_clients").state == "0"
+
+    # A client is no longer seen
+    mock_websocket_message(
+        message=MessageKey.CLIENT,
+        data=_network_client("00:00:00:00:00:04", "network-vlan", last_seen=0),
+    )
+    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.kids_clients").state == "2"
+
+    # Availability signalling
+
+    # Controller disconnects
+    await mock_websocket_state.disconnect()
+    assert hass.states.get("sensor.kids_clients").state == STATE_UNAVAILABLE
+    assert hass.states.get("sensor.lan_traffic").state == STATE_UNAVAILABLE
+
+    # Controller reconnects
+    await mock_websocket_state.reconnect()
+    assert hass.states.get("sensor.kids_clients").state == "2"
+
+    # Network gets disabled
+    mock_websocket_message(
+        message=MessageKey.NETWORK_CONF_UPDATED, data={**NETWORK_VLAN, "enabled": False}
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.kids_clients").state == STATE_UNAVAILABLE
+
+    # Network gets re-enabled
+    mock_websocket_message(message=MessageKey.NETWORK_CONF_UPDATED, data=NETWORK_VLAN)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.kids_clients").state == "2"
+
+
+@pytest.mark.parametrize("network_payload", [[NETWORK_LAN]])
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_network_sensors_added_and_removed(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_websocket_message: WebsocketMessageMock,
+) -> None:
+    """Verify network sensors follow networks added and changed by the controller."""
+    assert hass.states.get("sensor.lan_clients")
+    assert hass.states.get("sensor.kids_clients") is None
+
+    # A network is added
+    mock_websocket_message(message=MessageKey.NETWORK_CONF_UPDATED, data=NETWORK_VLAN)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.kids_clients").state == "0"
+
+    # The network turns into a WAN, which has no clients
+    mock_websocket_message(
+        message=MessageKey.NETWORK_CONF_UPDATED, data={**NETWORK_VLAN, "purpose": "wan"}
+    )
+    await hass.async_block_till_done()
+    assert entity_registry.async_get("sensor.kids_clients") is None

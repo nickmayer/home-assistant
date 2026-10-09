@@ -57,6 +57,13 @@ def async_wlan_available_fn(hub: UnifiHub, obj_id: str) -> bool:
 
 
 @callback
+def async_network_available_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Check if network is available."""
+    network = hub.api.networks[obj_id]
+    return hub.available and bool(network.enabled)
+
+
+@callback
 def async_device_device_info_fn(hub: UnifiHub, obj_id: str) -> DeviceInfo:
     """Create device registry entry for device."""
     if "_" in obj_id:  # Sub device (outlet or port)
@@ -83,6 +90,19 @@ def async_wlan_device_info_fn(hub: UnifiHub, obj_id: str) -> DeviceInfo:
         manufacturer=ATTR_MANUFACTURER,
         model="UniFi WLAN",
         name=wlan.name,
+    )
+
+
+@callback
+def async_network_device_info_fn(hub: UnifiHub, obj_id: str) -> DeviceInfo:
+    """Create device registry entry for network."""
+    network = hub.api.networks[obj_id]
+    return DeviceInfo(
+        entry_type=DeviceEntryType.SERVICE,
+        identifiers={(DOMAIN, network.id)},
+        manufacturer=ATTR_MANUFACTURER,
+        model="UniFi Network",
+        name=network.name,
     )
 
 

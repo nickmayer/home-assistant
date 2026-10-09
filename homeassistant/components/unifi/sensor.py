@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal, cast, override
 from aiounifi.interfaces.api_handlers import APIHandler, ItemEvent
 from aiounifi.interfaces.clients import Clients
 from aiounifi.interfaces.devices import Devices
+from aiounifi.interfaces.networks import Networks
 from aiounifi.interfaces.outlets import Outlets
 from aiounifi.interfaces.ports import Ports
 from aiounifi.interfaces.wlans import Wlans
@@ -24,6 +25,7 @@ from aiounifi.models.device import (
     TypedDeviceTemperature,
     TypedDeviceUptimeStatsWanMonitor,
 )
+from aiounifi.models.network import Network
 from aiounifi.models.outlet import Outlet
 from aiounifi.models.port import Port
 from aiounifi.models.wlan import Wlan
@@ -59,6 +61,8 @@ from .entity import (
     async_client_device_info_fn,
     async_device_available_fn,
     async_device_device_info_fn,
+    async_network_available_fn,
+    async_network_device_info_fn,
     async_wlan_available_fn,
     async_wlan_device_info_fn,
     is_locally_administered_mac,
@@ -66,6 +70,8 @@ from .entity import (
 from .hub import UnifiHub
 
 PARALLEL_UPDATES = 0
+
+NETWORK_PURPOSES_WITH_CLIENTS = ("corporate", "guest", "vlan-only")
 
 # UniFi names the first WAN "WAN", not "WAN1".
 type WanName = Literal["WAN", "WAN2", "WAN3"]
@@ -151,6 +157,42 @@ def async_wlan_client_value_fn(hub: UnifiHub, wlan: Wlan) -> int:
             < hub.config.option_detection_time
         ]
     )
+
+
+@callback
+def async_network_supported_fn(hub: UnifiHub, obj_id: str) -> bool:
+    """Check if clients can connect to the network, which is not the case for WAN and VPN."""
+    return hub.api.networks[obj_id].purpose in NETWORK_PURPOSES_WITH_CLIENTS
+
+
+@callback
+def async_network_clients(hub: UnifiHub, network: Network) -> list[Client]:
+    """Return the clients that are connected to a network."""
+    return [
+        client
+        for client in hub.api.clients.values()
+        if client.raw.get("network_id") == network.id
+        and async_client_is_connected_fn(hub, client.mac)
+    ]
+
+
+@callback
+def async_network_clients_value_fn(hub: UnifiHub, network: Network) -> int:
+    """Calculate the amount of clients connected to a network."""
+    return len(async_network_clients(hub, network))
+
+
+@callback
+def async_network_traffic_value_fn(hub: UnifiHub, network: Network) -> float:
+    """Calculate the total data transfer (Mbit/s) of the clients on a network."""
+    wireless_clients = hub.entity_loader.wireless_clients
+    bytes_per_second = 0.0
+    for client in async_network_clients(hub, network):
+        if wireless_clients.is_wireless(client):
+            bytes_per_second += client.rx_bytes_r + client.tx_bytes_r
+        else:
+            bytes_per_second += client.wired_rx_bytes_r + client.wired_tx_bytes_r
+    return round(bytes_per_second * 8 / 1_000_000, 3)
 
 
 @callback
@@ -585,6 +627,38 @@ ENTITY_DESCRIPTIONS: tuple[UnifiSensorEntityDescription, ...] = (
         should_poll=True,
         unique_id_fn=lambda hub, obj_id: f"wlan_clients-{obj_id}",
         value_fn=async_wlan_client_value_fn,
+    ),
+    UnifiSensorEntityDescription[Networks, Network](
+        key="Network clients",
+        translation_key="network_clients",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        api_handler_fn=lambda api: api.networks,
+        available_fn=async_network_available_fn,
+        device_info_fn=async_network_device_info_fn,
+        object_fn=lambda api, obj_id: api.networks[obj_id],
+        should_poll=True,
+        supported_fn=async_network_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"network_clients-{obj_id}",
+        value_fn=async_network_clients_value_fn,
+    ),
+    UnifiSensorEntityDescription[Networks, Network](
+        key="Network traffic",
+        translation_key="network_traffic",
+        device_class=SensorDeviceClass.DATA_RATE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
+        suggested_display_precision=2,
+        entity_registry_enabled_default=False,
+        api_handler_fn=lambda api: api.networks,
+        available_fn=async_network_available_fn,
+        device_info_fn=async_network_device_info_fn,
+        object_fn=lambda api, obj_id: api.networks[obj_id],
+        should_poll=True,
+        supported_fn=async_network_supported_fn,
+        unique_id_fn=lambda hub, obj_id: f"network_traffic-{obj_id}",
+        value_fn=async_network_traffic_value_fn,
     ),
     UnifiSensorEntityDescription[Devices, Device](
         key="Device clients",
