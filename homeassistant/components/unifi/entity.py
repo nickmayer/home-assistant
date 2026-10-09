@@ -13,6 +13,7 @@ from aiounifi.interfaces.api_handlers import (
     UnsubscribeType,
 )
 from aiounifi.models.api import ApiItem
+from aiounifi.models.client import Client
 from aiounifi.models.event import Event, EventKey
 
 from homeassistant.core import callback
@@ -25,13 +26,18 @@ from homeassistant.helpers.device_registry import (
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity, EntityDescription
 
-from .const import ATTR_MANUFACTURER, DOMAIN
+from .const import ATTR_MANUFACTURER, DOMAIN, VLAN_NATIVE
 from .coordinator import UnifiDataUpdateCoordinator
 
 if TYPE_CHECKING:
     from .hub import UnifiHub
 
 type SubscriptionType = Callable[[CallbackType, ItemEvent], UnsubscribeType]
+
+
+def get_client_vlan(client: Client) -> str:
+    """Return the VLAN ID of a client as text, or VLAN_NATIVE if it is untagged."""
+    return str(client.raw.get("vlan") or VLAN_NATIVE)
 
 
 def is_locally_administered_mac(mac: str) -> bool:

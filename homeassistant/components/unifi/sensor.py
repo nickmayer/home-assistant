@@ -45,13 +45,15 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import Event as core_Event, HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.util import dt as dt_util, slugify
 
 from . import UnifiConfigEntry
-from .const import DEVICE_STATES
+from .const import ATTR_MANUFACTURER, DEVICE_STATES, DOMAIN, VLAN_NATIVE
 from .device_tracker import async_client_allowed_fn
 from .entity import (
     UnifiEntity,
@@ -61,6 +63,7 @@ from .entity import (
     async_device_device_info_fn,
     async_wlan_available_fn,
     async_wlan_device_info_fn,
+    get_client_vlan,
     is_locally_administered_mac,
 )
 from .hub import UnifiHub
@@ -894,6 +897,7 @@ async def async_setup_entry(
     config_entry.runtime_data.entity_loader.register_platform(
         async_add_entities, UnifiSensorEntity, ENTITY_DESCRIPTIONS
     )
+    async_setup_vlan_sensors(hass, config_entry, async_add_entities)
 
 
 class UnifiSensorEntity[HandlerT: APIHandler, ApiItemT: ApiItem](
@@ -960,3 +964,159 @@ class UnifiSensorEntity[HandlerT: APIHandler, ApiItemT: ApiItem](
         if self.entity_description.is_connected_fn is not None:
             # Remove heartbeat registration
             self.hub.remove_heartbeat(self._attr_unique_id)
+
+
+@callback
+def async_vlan_clients(hub: UnifiHub, vlan: str) -> list[Client]:
+    """Return the clients that are connected on a VLAN."""
+    return [
+        client
+        for client in hub.api.clients.values()
+        if get_client_vlan(client) == vlan
+        and async_client_is_connected_fn(hub, client.mac)
+    ]
+
+
+@callback
+def async_vlan_clients_value_fn(hub: UnifiHub, clients: list[Client]) -> int:
+    """Calculate the number of clients connected on a VLAN."""
+    return len(clients)
+
+
+@callback
+def async_vlan_traffic_value_fn(hub: UnifiHub, clients: list[Client]) -> float:
+    """Calculate the total data transfer (Mbit/s) of the clients on a VLAN."""
+    wireless_clients = hub.entity_loader.wireless_clients
+    bytes_per_second = 0.0
+    for client in clients:
+        if wireless_clients.is_wireless(client):
+            bytes_per_second += client.rx_bytes_r + client.tx_bytes_r
+        else:
+            bytes_per_second += client.wired_rx_bytes_r + client.wired_tx_bytes_r
+    return round(bytes_per_second * 8 / 1_000_000, 3)
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnifiVlanSensorEntityDescription(SensorEntityDescription):
+    """Class describing UniFi VLAN sensor entity."""
+
+    value_fn: Callable[[UnifiHub, list[Client]], float | int]
+
+
+VLAN_ENTITY_DESCRIPTIONS: tuple[UnifiVlanSensorEntityDescription, ...] = (
+    UnifiVlanSensorEntityDescription(
+        key="VLAN clients",
+        translation_key="vlan_clients",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=async_vlan_clients_value_fn,
+    ),
+    UnifiVlanSensorEntityDescription(
+        key="VLAN traffic",
+        translation_key="vlan_traffic",
+        device_class=SensorDeviceClass.DATA_RATE,
+        native_unit_of_measurement=UnitOfDataRate.MEGABITS_PER_SECOND,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
+        value_fn=async_vlan_traffic_value_fn,
+    ),
+)
+
+
+@callback
+def async_setup_vlan_sensors(
+    hass: HomeAssistant,
+    config_entry: UnifiConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Create sensors for the VLANs selected in the options."""
+    hub = config_entry.runtime_data
+
+    @callback
+    def add_vlan_sensors() -> None:
+        """Add sensors for VLANs that were added to the options."""
+        async_add_entities(
+            UnifiVlanSensor(hub, vlan, description)
+            for vlan in hub.config.option_vlan_sensors
+            for description in VLAN_ENTITY_DESCRIPTIONS
+            if (description.key, vlan) not in hub.entity_loader.known_objects
+        )
+
+    add_vlan_sensors()
+    config_entry.async_on_unload(
+        async_dispatcher_connect(hass, hub.signal_options_update, add_vlan_sensors)
+    )
+
+
+class UnifiVlanSensor(SensorEntity):
+    """Statistic about the clients connected on a VLAN."""
+
+    entity_description: UnifiVlanSensorEntityDescription
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        hub: UnifiHub,
+        vlan: str,
+        description: UnifiVlanSensorEntityDescription,
+    ) -> None:
+        """Set up the sensor."""
+        self.hub = hub
+        self.vlan = vlan
+        self.entity_description = description
+
+        hub.entity_loader.known_objects.add((description.key, vlan))
+
+        site = hub.config.site
+        self._attr_unique_id = f"{description.translation_key}-{site}-{vlan}"
+        self._attr_device_info = DeviceInfo(
+            entry_type=DeviceEntryType.SERVICE,
+            identifiers={(DOMAIN, f"vlan-{site}-{vlan}")},
+            manufacturer=ATTR_MANUFACTURER,
+            model="UniFi VLAN",
+            name="Native VLAN" if vlan == VLAN_NATIVE else f"VLAN {vlan}",
+        )
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if the sensor is available."""
+        return self.hub.available
+
+    @property
+    @override
+    def native_value(self) -> float | int:
+        """Return the value of the sensor."""
+        return self.entity_description.value_fn(
+            self.hub, async_vlan_clients(self.hub, self.vlan)
+        )
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks."""
+
+        @callback
+        def unregister_object() -> None:
+            """Allow the sensor to be created again when unloaded."""
+            self.hub.entity_loader.known_objects.discard(
+                (self.entity_description.key, self.vlan)
+            )
+
+        self.async_on_remove(unregister_object)
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, self.hub.signal_reachable, self.async_write_ha_state
+            )
+        )
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                self.hub.signal_options_update,
+                self.async_signal_options_updated,
+            )
+        )
+
+    @callback
+    def async_signal_options_updated(self) -> None:
+        """Config entry options are updated, remove entity if VLAN was removed."""
+        if self.vlan not in self.hub.config.option_vlan_sensors:
+            er.async_get(self.hass).async_remove(self.entity_id)

@@ -30,6 +30,8 @@ CONF_SITE_ID = "site"
 
 UNIFI_WIRELESS_CLIENTS = "unifi_wireless_clients"
 
+VLAN_NATIVE = "native"
+
 CONF_ALLOW_BANDWIDTH_SENSORS = "allow_bandwidth_sensors"
 CONF_ALLOW_UPTIME_SENSORS = "allow_uptime_sensors"
 CONF_BLOCK_CLIENT = "block_client"
@@ -41,6 +43,7 @@ CONF_IGNORE_WIRED_BUG = "ignore_wired_bug"
 CONF_TRACK_CLIENTS = "track_clients"
 CONF_TRACK_DEVICES = "track_devices"
 CONF_TRACK_WIRED_CLIENTS = "track_wired_clients"
+CONF_VLAN_SENSORS = "vlan_sensors"
 CONF_MORE_OPTIONS = "more_options"
 CONF_SSID_FILTER = "ssid_filter"
 

@@ -27,8 +27,10 @@ from homeassistant.components.unifi.const import (
     CONF_TRACK_CLIENTS,
     CONF_TRACK_DEVICES,
     CONF_TRACK_WIRED_CLIENTS,
+    CONF_VLAN_SENSORS,
     DEFAULT_DETECTION_TIME,
     DEVICE_STATES,
+    VLAN_NATIVE,
 )
 from homeassistant.config_entries import RELOAD_AFTER_UPDATE_DELAY
 from homeassistant.const import (
@@ -2592,3 +2594,168 @@ async def test_device_uplink(
     device["uplink"]["uplink_mac"] = "00:00:00:00:00:03"
     mock_websocket_message(message=MessageKey.DEVICE, data=device)
     assert hass.states.get("sensor.device_uplink_mac").state == "00:00:00:00:00:03"
+
+
+def _vlan_client(
+    mac: str,
+    *,
+    vlan: int | None = None,
+    wired: bool = False,
+    last_seen: float | None = None,
+    rx_bytes_r: float = 0,
+    tx_bytes_r: float = 0,
+) -> dict[str, Any]:
+    """Create a client payload, rates are given in bytes per second."""
+    client: dict[str, Any] = {
+        "is_wired": wired,
+        "last_seen": dt_util.as_timestamp(dt_util.utcnow())
+        if last_seen is None
+        else last_seen,
+        "mac": mac,
+        "name": f"Client {mac[-2:]}",
+        "oui": "Producer",
+    }
+    if vlan is not None:
+        client["vlan"] = vlan
+    if wired:
+        client["wired-rx_bytes-r"] = rx_bytes_r
+        client["wired-tx_bytes-r"] = tx_bytes_r
+        # Wired clients must be measured using the wired counters
+        client["rx_bytes-r"] = 999_000_000
+        client["tx_bytes-r"] = 999_000_000
+    else:
+        client["rx_bytes-r"] = rx_bytes_r
+        client["tx_bytes-r"] = tx_bytes_r
+    return client
+
+
+@pytest.mark.parametrize(
+    "config_entry_options", [{CONF_VLAN_SENSORS: ["11", VLAN_NATIVE]}]
+)
+@pytest.mark.usefixtures("entity_registry_enabled_by_default")
+async def test_vlan_sensor_entity_and_device_data(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    config_entry_factory: ConfigEntryFactoryType,
+    client_payload: list[dict[str, Any]],
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Validate VLAN sensor entity and device data."""
+    client_payload += [
+        _vlan_client("00:00:00:00:00:01", vlan=11, rx_bytes_r=125_000),
+        _vlan_client("00:00:00:00:00:02"),
+    ]
+    with patch("homeassistant.components.unifi.PLATFORMS", [Platform.SENSOR]):
+        config_entry = await config_entry_factory()
+    await snapshot_platform(hass, entity_registry, snapshot, config_entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    "config_entry_options", [{CONF_VLAN_SENSORS: ["11", "12", VLAN_NATIVE]}]
+)
+async def test_vlan_sensors(
+    hass: HomeAssistant,
+    config_entry_factory: ConfigEntryFactoryType,
+    mock_websocket_message: WebsocketMessageMock,
+    mock_websocket_state: WebsocketStateManager,
+    client_payload: list[dict[str, Any]],
+) -> None:
+    """Verify that VLAN sensors are working as expected."""
+    client_payload += [
+        _vlan_client(
+            "00:00:00:00:00:01", vlan=11, rx_bytes_r=125_000, tx_bytes_r=125_000
+        ),
+        _vlan_client("00:00:00:00:00:02", vlan=11, wired=True, rx_bytes_r=250_000),
+        _vlan_client("00:00:00:00:00:03", vlan=12, last_seen=0),
+        _vlan_client("00:00:00:00:00:04", rx_bytes_r=1_250_000),
+        _vlan_client("00:00:00:00:00:05", vlan=99, rx_bytes_r=5_000_000),
+    ]
+    await config_entry_factory()
+
+    assert len(hass.states.async_entity_ids(SENSOR_DOMAIN)) == 6
+    assert hass.states.get("sensor.vlan_11_clients").state == "2"
+    assert hass.states.get("sensor.vlan_11_traffic").state == "4.0"
+    assert hass.states.get("sensor.vlan_12_clients").state == "0"
+    assert hass.states.get("sensor.vlan_12_traffic").state == "0.0"
+    assert hass.states.get("sensor.native_vlan_clients").state == "1"
+    assert hass.states.get("sensor.native_vlan_traffic").state == "10.0"
+
+    # A client connects to VLAN 12
+    mock_websocket_message(
+        message=MessageKey.CLIENT,
+        data=_vlan_client("00:00:00:00:00:03", vlan=12, rx_bytes_r=62_500),
+    )
+    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.vlan_12_clients").state == "1"
+    assert hass.states.get("sensor.vlan_12_traffic").state == "0.5"
+
+    # The client moves to VLAN 11
+    mock_websocket_message(
+        message=MessageKey.CLIENT,
+        data=_vlan_client("00:00:00:00:00:03", vlan=11, rx_bytes_r=62_500),
+    )
+    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.vlan_12_clients").state == "0"
+    assert hass.states.get("sensor.vlan_11_clients").state == "3"
+    assert hass.states.get("sensor.vlan_11_traffic").state == "4.5"
+
+    # The client is no longer seen
+    mock_websocket_message(
+        message=MessageKey.CLIENT,
+        data=_vlan_client("00:00:00:00:00:03", vlan=11, last_seen=0),
+    )
+    async_fire_time_changed(hass, dt_util.utcnow() + SCAN_INTERVAL)
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.vlan_11_clients").state == "2"
+
+    # Availability signalling
+
+    # Controller disconnects
+    await mock_websocket_state.disconnect()
+    assert hass.states.get("sensor.vlan_11_clients").state == STATE_UNAVAILABLE
+    assert hass.states.get("sensor.native_vlan_traffic").state == STATE_UNAVAILABLE
+
+    # Controller reconnects
+    await mock_websocket_state.reconnect()
+    assert hass.states.get("sensor.vlan_11_clients").state == "2"
+    assert hass.states.get("sensor.native_vlan_traffic").state == "10.0"
+
+
+@pytest.mark.usefixtures("config_entry_setup")
+async def test_no_vlan_sensors_by_default(hass: HomeAssistant) -> None:
+    """Verify that no VLAN sensors are created unless selected in the options."""
+    assert len(hass.states.async_entity_ids(SENSOR_DOMAIN)) == 0
+
+
+@pytest.mark.parametrize("config_entry_options", [{CONF_VLAN_SENSORS: ["11", "12"]}])
+async def test_vlan_sensors_option_changes(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Verify that VLAN sensors are added and removed with the options."""
+    assert hass.states.get("sensor.vlan_11_clients")
+    assert hass.states.get("sensor.vlan_12_clients")
+    assert hass.states.get("sensor.vlan_30_clients") is None
+
+    # Add VLAN 30 and remove VLAN 11
+    hass.config_entries.async_update_entry(
+        config_entry_setup, options={CONF_VLAN_SENSORS: ["12", "30"]}
+    )
+    await hass.async_block_till_done()
+
+    assert entity_registry.async_get("sensor.vlan_11_clients") is None
+    assert entity_registry.async_get("sensor.vlan_11_traffic") is None
+    assert hass.states.get("sensor.vlan_12_clients")
+    assert hass.states.get("sensor.vlan_30_clients")
+    assert hass.states.get("sensor.vlan_30_traffic")
+
+    # A removed VLAN can be added again
+    hass.config_entries.async_update_entry(
+        config_entry_setup, options={CONF_VLAN_SENSORS: ["11", "12", "30"]}
+    )
+    await hass.async_block_till_done()
+    assert hass.states.get("sensor.vlan_11_clients")
+    assert hass.states.get("sensor.vlan_11_traffic")

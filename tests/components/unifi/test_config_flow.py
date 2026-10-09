@@ -24,6 +24,7 @@ from homeassistant.components.unifi.const import (
     CONF_TRACK_CLIENTS,
     CONF_TRACK_DEVICES,
     CONF_TRACK_WIRED_CLIENTS,
+    CONF_VLAN_SENSORS,
     DOMAIN,
 )
 from homeassistant.components.unifi.errors import AuthenticationRequired, CannotConnect
@@ -509,6 +510,7 @@ async def test_option_flow(
                 CONF_DPI_RESTRICTIONS: False,
                 CONF_ALLOW_BANDWIDTH_SENSORS: True,
                 CONF_ALLOW_UPTIME_SENSORS: True,
+                CONF_VLAN_SENSORS: ["11", "12"],
             },
         },
     )
@@ -527,7 +529,93 @@ async def test_option_flow(
         CONF_BLOCK_CLIENT: [CLIENTS[0]["mac"]],
         CONF_ALLOW_BANDWIDTH_SENSORS: True,
         CONF_ALLOW_UPTIME_SENSORS: True,
+        CONF_VLAN_SENSORS: ["11", "12"],
     }
+
+
+@pytest.mark.parametrize("config_entry_options", [{CONF_VLAN_SENSORS: ["30"]}])
+@pytest.mark.parametrize(
+    "client_payload",
+    [
+        [
+            {"mac": "00:00:00:00:00:01", "name": "VLAN 20", "vlan": 20},
+            {"mac": "00:00:00:00:00:02", "name": "VLAN 20 again", "vlan": 20},
+            {"mac": "00:00:00:00:00:03", "name": "VLAN 11", "vlan": 11},
+            {"mac": "00:00:00:00:00:04", "name": "Untagged"},
+        ]
+    ],
+)
+async def test_option_flow_vlan_sensor_choices(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry
+) -> None:
+    """Test the VLAN sensors option suggests the VLANs of the clients and the selected ones."""
+    result = await hass.config_entries.options.async_init(config_entry_setup.entry_id)
+
+    more_options = next(
+        value
+        for key, value in result["data_schema"].schema.items()
+        if key == CONF_MORE_OPTIONS
+    )
+    vlan_selector = next(
+        value
+        for key, value in more_options.schema.schema.items()
+        if key == CONF_VLAN_SENSORS
+    )
+    assert vlan_selector.config["options"] == ["11", "20", "30", "native"]
+
+
+@pytest.mark.parametrize(
+    ("selected", "expected"),
+    [
+        pytest.param(["11", "12"], ["11", "12"], id="ids"),
+        pytest.param(
+            [" 013 ", "NATIVE", "4094", "13"],
+            ["13", "native", "4094"],
+            id="normalized",
+        ),
+        pytest.param([], [], id="none"),
+    ],
+)
+async def test_option_flow_vlan_sensors(
+    hass: HomeAssistant,
+    config_entry_setup: MockConfigEntry,
+    selected: list[str],
+    expected: list[str],
+) -> None:
+    """Test the selected VLANs are stored normalized and without duplicates."""
+    result = await hass.config_entries.options.async_init(config_entry_setup.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_MORE_OPTIONS: {CONF_VLAN_SENSORS: selected}},
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_VLAN_SENSORS] == expected
+
+
+@pytest.mark.parametrize("vlan", ["0", "4095", "abc", "1.5", "-3", " "])
+async def test_option_flow_invalid_vlan(
+    hass: HomeAssistant, config_entry_setup: MockConfigEntry, vlan: str
+) -> None:
+    """Test invalid VLANs are rejected."""
+    result = await hass.config_entries.options.async_init(config_entry_setup.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_MORE_OPTIONS: {CONF_VLAN_SENSORS: ["11", vlan]}},
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    assert result["errors"] == {"base": "invalid_vlan"}
+    assert CONF_VLAN_SENSORS not in config_entry_setup.options
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={CONF_MORE_OPTIONS: {CONF_VLAN_SENSORS: ["11"]}},
+    )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_VLAN_SENSORS] == ["11"]
 
 
 async def test_discover_unifi_positive(hass: HomeAssistant) -> None:

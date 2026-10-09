@@ -162,6 +162,12 @@
       "ups_output_voltage": {
         "name": "Output voltage"
       },
+      "vlan_clients": {
+        "name": "Clients"
+      },
+      "vlan_traffic": {
+        "name": "Traffic"
+      },
       "wan_latency": {
         "name": "{target} {wan} latency"
       },
@@ -205,6 +211,9 @@
     "abort": {
       "integration_not_setup": "UniFi integration is not set up"
     },
+    "error": {
+      "invalid_vlan": "VLAN IDs must be a number between 1 and 4094, or \"native\""
+    },
     "step": {
       "init": {
         "data": {
@@ -228,7 +237,8 @@
               "ignore_local_mac": "Ignore Wi-Fi clients with private (e.g. randomized) MAC addresses",
               "ignore_wired_bug": "Disable UniFi Network wired bug logic",
               "ssid_filter": "Select SSIDs to track wireless clients on",
-              "track_wired_clients": "Include wired network clients"
+              "track_wired_clients": "Include wired network clients",
+              "vlan_sensors": "VLANs to create sensors for"
             },
             "data_description": {
               "allow_bandwidth_sensors": "Create bandwidth usage sensors for network clients.",
@@ -239,7 +249,8 @@
               "ignore_local_mac": "Don't create entities for Wi-Fi clients whose MAC is locally administered (e.g. private/randomized Wi-Fi addresses). Wired clients are unaffected. Clients in \"Create entities from network clients\" are still included.",
               "ignore_wired_bug": "Disable workaround for a UniFi Network bug that sometimes reports wired clients as wireless.",
               "ssid_filter": "Only track wireless clients connected to selected SSIDs.",
-              "track_wired_clients": "Include wired clients in device tracking."
+              "track_wired_clients": "Include wired clients in device tracking.",
+              "vlan_sensors": "Create a sensor for the number of connected clients and one for the total data transfer of each selected VLAN. Select \"native\" for clients without a VLAN tag, or enter a VLAN ID that has no clients yet."
             },
             "name": "More options"
           }

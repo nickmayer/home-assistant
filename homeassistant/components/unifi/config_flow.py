@@ -35,6 +35,11 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import AbortFlow, SectionConfig, section
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 from homeassistant.helpers.typing import DiscoveryInfoType
 
 from . import UnifiConfigEntry
@@ -53,9 +58,12 @@ from .const import (
     CONF_TRACK_CLIENTS,
     CONF_TRACK_DEVICES,
     CONF_TRACK_WIRED_CLIENTS,
+    CONF_VLAN_SENSORS,
     DEFAULT_DPI_RESTRICTIONS,
     DOMAIN,
+    VLAN_NATIVE,
 )
+from .entity import get_client_vlan
 from .errors import AuthenticationRequired, CannotConnect
 from .hub import UnifiHub, get_unifi_api
 
@@ -278,6 +286,23 @@ class UnifiFlowHandler(ConfigFlow, domain=DOMAIN):
         return self._get_reconfigure_entry()
 
 
+def _normalize_vlan(vlan: str) -> str:
+    """Return a VLAN ID without surrounding spaces or leading zeros."""
+    vlan = vlan.strip().lower()
+    return str(int(vlan)) if vlan.isdecimal() else vlan
+
+
+def _is_valid_vlan(vlan: str) -> bool:
+    """Return if the value is a VLAN ID (1-4094) or the untagged VLAN."""
+    vlan = _normalize_vlan(vlan)
+    return vlan == VLAN_NATIVE or (vlan.isdecimal() and 1 <= int(vlan) <= 4094)
+
+
+def _vlan_sort_key(vlan: str) -> tuple[bool, int]:
+    """Sort VLAN IDs numerically with the untagged VLAN last."""
+    return (not vlan.isdecimal(), int(vlan) if vlan.isdecimal() else 0)
+
+
 class UnifiOptionsFlowHandler(OptionsFlow):
     """Handle Unifi Network options."""
 
@@ -294,11 +319,18 @@ class UnifiOptionsFlowHandler(OptionsFlow):
         self.hub = self.config_entry.runtime_data
         self.options[CONF_BLOCK_CLIENT] = self.hub.config.option_block_clients
 
+        errors: dict[str, str] = {}
         if user_input is not None:
             more_options = user_input.pop(CONF_MORE_OPTIONS, {})
             user_input.update(more_options)
-            self.options.update(user_input)
-            return self.async_create_entry(title="", data=self.options)
+            vlans = user_input.get(CONF_VLAN_SENSORS, [])
+            if all(_is_valid_vlan(vlan) for vlan in vlans):
+                user_input[CONF_VLAN_SENSORS] = list(
+                    dict.fromkeys(map(_normalize_vlan, vlans))
+                )
+                self.options.update(user_input)
+                return self.async_create_entry(title="", data=self.options)
+            errors["base"] = "invalid_vlan"
 
         clients_to_block = {}
         for client in self.hub.api.clients.values():
@@ -343,8 +375,15 @@ class UnifiOptionsFlowHandler(OptionsFlow):
             ssid for ssid in self.hub.config.option_ssid_filter if ssid in ssid_filter
         ]
 
+        known_vlans = {
+            get_client_vlan(client) for client in self.hub.api.clients.values()
+        }
+        known_vlans.update(self.hub.config.option_vlan_sensors)
+        vlan_options = sorted(known_vlans, key=_vlan_sort_key)
+
         return self.async_show_form(
             step_id="init",
+            errors=errors,
             data_schema=probatio.Schema(
                 {
                     probatio.Optional(
@@ -409,6 +448,17 @@ class UnifiOptionsFlowHandler(OptionsFlow):
                                     CONF_ALLOW_UPTIME_SENSORS,
                                     default=self.hub.config.option_allow_uptime_sensors,
                                 ): bool,
+                                probatio.Optional(
+                                    CONF_VLAN_SENSORS,
+                                    default=self.hub.config.option_vlan_sensors,
+                                ): SelectSelector(
+                                    SelectSelectorConfig(
+                                        options=vlan_options,
+                                        multiple=True,
+                                        custom_value=True,
+                                        mode=SelectSelectorMode.DROPDOWN,
+                                    )
+                                ),
                             }
                         ),
                         SectionConfig(collapsed=True),
