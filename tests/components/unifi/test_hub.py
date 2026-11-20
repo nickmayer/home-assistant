@@ -34,10 +34,13 @@ from homeassistant.components.unifi.hub.connection import REQUEST_TIMEOUT
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.const import EVENT_STATE_REPORTED, Platform
 from homeassistant.core import Event, EventStateReportedData, HomeAssistant, callback
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .conftest import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DEFAULT_SITE,
     ConfigEntryFactoryType,
     WebsocketMessageMock,
     WebsocketStateManager,
@@ -468,6 +471,136 @@ async def test_recovery_refetches_each_handler_once(
     await mock_websocket_state.reconnect()
 
     assert request_count() == requests_before + 1
+
+
+TRAFFIC_RULE = {
+    "_id": "6452cd9b859d5b11aa002ea1",
+    "action": "BLOCK",
+    "enabled": True,
+    "description": "Block Internet",
+    "name": "Block Internet",
+    "target_devices": [],
+}
+# The same rule after UniFi Network gave it a new ID
+TRAFFIC_RULE_NEW_ID = {**TRAFFIC_RULE, "_id": "972fb9b8-ca18-46fb-a893-bee7b0b682dd"}
+
+WLAN = {"_id": "012345678910111213141516", "enabled": True, "name": "SSID 1"}
+WLAN_NEW_ID = {**WLAN, "_id": "6f3e9e2e-a245-407d-af7c-04984166bcf8"}
+
+
+def mock_list(
+    aioclient_mock: AiohttpClientMocker, path: str, payload: list[dict[str, Any]]
+) -> None:
+    """Answer a list request of the default site."""
+    url = f"https://{DEFAULT_HOST}:{DEFAULT_PORT}"
+    if path.startswith("/v2"):
+        json: Any = payload
+    else:
+        json = {"meta": {"rc": "ok"}, "data": payload}
+    aioclient_mock.get(
+        f"{url}{path}", json=json, headers={"content-type": "application/json"}
+    )
+
+
+@pytest.mark.parametrize("traffic_rule_payload", [[TRAFFIC_RULE]])
+async def test_poll_removes_objects_no_longer_listed(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Remove an object, and its entity, once the controller lists it no more."""
+    api = config_entry_setup.runtime_data.api
+    loader = config_entry_setup.runtime_data.entity_loader
+    old_unique_id = f"traffic_rule-{TRAFFIC_RULE['_id']}"
+    assert entity_registry.async_get_entity_id(SWITCH_DOMAIN, DOMAIN, old_unique_id)
+
+    aioclient_mock.clear_requests()
+    mock_list(
+        aioclient_mock,
+        f"/v2/api/site/{DEFAULT_SITE}/trafficrules",
+        [TRAFFIC_RULE_NEW_ID],
+    )
+    await loader.get_data_update_coordinator(api.traffic_rules).async_refresh()
+    await hass.async_block_till_done()
+
+    assert list(api.traffic_rules) == [TRAFFIC_RULE_NEW_ID["_id"]]
+    assert not entity_registry.async_get_entity_id(SWITCH_DOMAIN, DOMAIN, old_unique_id)
+    assert entity_registry.async_get_entity_id(
+        SWITCH_DOMAIN, DOMAIN, f"traffic_rule-{TRAFFIC_RULE_NEW_ID['_id']}"
+    )
+
+
+@pytest.mark.parametrize("wlan_payload", [[WLAN]])
+async def test_recovery_removes_objects_no_longer_listed(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_setup: MockConfigEntry,
+    mock_websocket_state: WebsocketStateManager,
+) -> None:
+    """Remove objects given a new ID while the connection was down."""
+    api = config_entry_setup.runtime_data.api
+    old_unique_id = f"wlan-{WLAN['_id']}"
+    assert entity_registry.async_get_entity_id(SWITCH_DOMAIN, DOMAIN, old_unique_id)
+
+    await mock_websocket_state.disconnect()
+    aioclient_mock.clear_requests()
+    mock_list(aioclient_mock, f"/api/s/{DEFAULT_SITE}/rest/wlanconf", [WLAN_NEW_ID])
+    await mock_websocket_state.reconnect()
+    await hass.async_block_till_done()
+
+    assert list(api.wlans) == [WLAN_NEW_ID["_id"]]
+    assert not entity_registry.async_get_entity_id(SWITCH_DOMAIN, DOMAIN, old_unique_id)
+    assert entity_registry.async_get_entity_id(
+        SWITCH_DOMAIN, DOMAIN, f"wlan-{WLAN_NEW_ID['_id']}"
+    )
+
+
+@pytest.mark.parametrize("traffic_rule_payload", [[TRAFFIC_RULE]])
+async def test_empty_answer_keeps_listed_objects(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Keep the objects when the controller answers with an empty list."""
+    api = config_entry_setup.runtime_data.api
+    loader = config_entry_setup.runtime_data.entity_loader
+
+    aioclient_mock.clear_requests()
+    mock_list(aioclient_mock, f"/v2/api/site/{DEFAULT_SITE}/trafficrules", [])
+    await loader.get_data_update_coordinator(api.traffic_rules).async_refresh()
+    await hass.async_block_till_done()
+
+    assert list(api.traffic_rules) == [TRAFFIC_RULE["_id"]]
+    assert entity_registry.async_get_entity_id(
+        SWITCH_DOMAIN, DOMAIN, f"traffic_rule-{TRAFFIC_RULE['_id']}"
+    )
+
+
+@pytest.mark.parametrize(
+    "client_payload", [[{"mac": "00:00:00:00:00:01", "name": "Client 1"}]]
+)
+async def test_clients_missing_from_answer_are_kept(
+    hass: HomeAssistant,
+    aioclient_mock: AiohttpClientMocker,
+    config_entry_setup: MockConfigEntry,
+) -> None:
+    """Keep clients the controller does not list, they are only inactive."""
+    api = config_entry_setup.runtime_data.api
+    loader = config_entry_setup.runtime_data.entity_loader
+
+    aioclient_mock.clear_requests()
+    mock_list(
+        aioclient_mock,
+        f"/api/s/{DEFAULT_SITE}/stat/sta",
+        [{"mac": "00:00:00:00:00:02", "name": "Client 2"}],
+    )
+    await loader.get_data_update_coordinator(api.clients).async_refresh()
+    await hass.async_block_till_done()
+
+    assert "00:00:00:00:00:01" in api.clients
 
 
 async def test_websocket_updates_notify_coordinator(

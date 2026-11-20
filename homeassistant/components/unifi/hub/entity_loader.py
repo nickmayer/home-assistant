@@ -48,35 +48,48 @@ class UnifiEntityLoader:
         self._startup_only_api_updaters = (self._async_update_clients_all,)
         self.wireless_clients = hub.hass.data[UNIFI_WIRELESS_CLIENTS]
 
+        # Configuration objects the controller no longer lists are removed.
+        # Clients and devices are not, clients and devices that are not active
+        # are restored and pruned on their own rules.
         self._data_coordinators: dict[int, UnifiDataUpdateCoordinator[Any]] = {
             id(hub.api.clients): UnifiDataUpdateCoordinator(hub, hub.api.clients),
             id(hub.api.devices): UnifiDeviceDataUpdateCoordinator(hub),
-            id(hub.api.dpi_apps): UnifiDataUpdateCoordinator(hub, hub.api.dpi_apps),
-            id(hub.api.dpi_groups): UnifiDataUpdateCoordinator(hub, hub.api.dpi_groups),
+            id(hub.api.dpi_apps): UnifiDataUpdateCoordinator(
+                hub, hub.api.dpi_apps, prune_unlisted=True
+            ),
+            id(hub.api.dpi_groups): UnifiDataUpdateCoordinator(
+                hub, hub.api.dpi_groups, prune_unlisted=True
+            ),
             id(hub.api.firewall_policies): UnifiDataUpdateCoordinator(
                 hub,
                 hub.api.firewall_policies,
                 disable_polling_on_endpoint_not_found=True,
+                prune_unlisted=True,
             ),
             id(hub.api.object_oriented_network_configs): UnifiDataUpdateCoordinator(
                 hub,
                 hub.api.object_oriented_network_configs,
                 disable_polling_on_endpoint_not_found=True,
+                prune_unlisted=True,
             ),
             id(hub.api.port_forwarding): UnifiDataUpdateCoordinator(
-                hub, hub.api.port_forwarding
+                hub, hub.api.port_forwarding, prune_unlisted=True
             ),
             id(hub.api.traffic_rules): UnifiDataUpdateCoordinator(
                 hub,
                 hub.api.traffic_rules,
                 disable_polling_on_endpoint_not_found=True,
+                prune_unlisted=True,
             ),
             id(hub.api.traffic_routes): UnifiDataUpdateCoordinator(
                 hub,
                 hub.api.traffic_routes,
                 disable_polling_on_endpoint_not_found=True,
+                prune_unlisted=True,
             ),
-            id(hub.api.wlans): UnifiDataUpdateCoordinator(hub, hub.api.wlans),
+            id(hub.api.wlans): UnifiDataUpdateCoordinator(
+                hub, hub.api.wlans, prune_unlisted=True
+            ),
         }
         self._data_coordinator_aliases: dict[int, int] = {
             id(hub.api.outlets): id(hub.api.devices),

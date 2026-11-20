@@ -52,8 +52,13 @@ class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
         handler: HandlerT,
         *,
         disable_polling_on_endpoint_not_found: bool = False,
+        prune_unlisted: bool = False,
     ) -> None:
-        """Initialize coordinator."""
+        """Initialize coordinator.
+
+        With prune_unlisted, objects the controller no longer lists are removed
+        from the handler on each fetch, see _async_fetch.
+        """
         supports_websocket = bool(handler.process_messages or handler.remove_messages)
         super().__init__(
             hub.hass,
@@ -71,6 +76,7 @@ class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
             disable_polling_on_endpoint_not_found
         )
         self._endpoint_not_found_logged = False
+        self._prune_unlisted = prune_unlisted
         self._initial_refresh = True
         self._update_generation = 0
         self._resync_task: asyncio.Task[None] | None = None
@@ -100,7 +106,7 @@ class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
         update_generation = self._update_generation
         try:
             async with asyncio.timeout(UPDATE_TIMEOUT):
-                await self._handler.update()
+                await self._async_fetch()
         except EndpointNotFound as err:
             if (
                 self._disable_polling_on_endpoint_not_found
@@ -166,7 +172,7 @@ class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
         name = type(self._handler).__name__
         try:
             async with asyncio.timeout(UPDATE_TIMEOUT):
-                await self._handler.update()
+                await self._async_fetch()
         except SESSION_CHECK_ERRORS as err:
             self._connection.verify_session(err)
         except aiounifi.AiounifiException as err:
@@ -179,6 +185,43 @@ class UnifiDataUpdateCoordinator[HandlerT: APIHandler](
                 self.async_set_updated_data(None)
 
         self._schedule_refresh()
+
+    async def _async_fetch(self) -> None:
+        """Fetch all objects of the handler.
+
+        aiounifi adds and changes objects on a fetch but never removes them.
+        UniFi Network can give objects new IDs, for example when it moves a site
+        to zone based firewall policies, while Home Assistant stays connected.
+        With prune_unlisted the objects missing from the answer are removed,
+        which removes their entities, instead of staying until a reload.
+        """
+        handler = self._handler
+        if not self._prune_unlisted:
+            await handler.update()
+            return
+
+        # aiounifi signals each object of the answer as added or changed
+        listed: set[str] = set()
+        unsubscribe = handler.subscribe(
+            lambda event, obj_id: listed.add(obj_id),
+            (ItemEvent.ADDED, ItemEvent.CHANGED),
+        )
+        try:
+            await handler.update()
+        finally:
+            unsubscribe()
+
+        # A starting application can answer with an empty list for a moment
+        if not listed:
+            return
+        for obj_id, item in list(handler.items()):
+            if obj_id not in listed:
+                LOGGER.debug(
+                    "Removing UniFi %s %s, no longer listed",
+                    type(handler).__name__,
+                    obj_id,
+                )
+                handler.remove_item(dict(item.raw))
 
     @callback
     def _async_handle_update(self, event: ItemEvent, obj_id: str) -> None:
